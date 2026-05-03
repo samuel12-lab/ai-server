@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -14,7 +15,8 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AIServer")
 
-GREEN_AI_URL = "https://forest-whisper--sayo02517.replit.app"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 class AgentRegistration(BaseModel):
     agent_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -61,7 +63,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 async def root():
-    return {"server": "Humanoid to Server AI", "status": "online", "ai": GREEN_AI_URL}
+    return {"server": "Humanoid to Server AI", "status": "online", "ai": "Google Gemini"}
 
 @app.post("/agents/register")
 async def register_agent(agent: AgentRegistration):
@@ -81,19 +83,23 @@ async def infer(req: InferenceRequest):
     output = ""
     try:
         async with aiohttp.ClientSession() as session:
+            payload = {
+                "contents": [{"parts": [{"text": req.input}]}]
+            }
             async with session.post(
-                f"{GREEN_AI_URL}/api/chat",
-                json={"message": req.input},
+                GEMINI_URL,
+                json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    output = data.get("reply") or data.get("message") or data.get("response") or str(data)
+                    output = data["candidates"][0]["content"]["parts"][0]["text"]
                 else:
-                    output = f"Green AI returned status {resp.status}"
+                    error = await resp.text()
+                    output = f"Gemini error: {error[:100]}"
     except Exception as e:
-        output = f"Could not reach Green AI: {str(e)}"
+        output = f"Error: {str(e)}"
     latency = round((time.time() - t0) * 1000, 2)
     request_counter += 1
     return InferenceResponse(
@@ -113,7 +119,7 @@ async def server_status():
         "total_agents": len(registry.all_agents()),
         "total_requests": request_counter,
         "phases": registry.phases_summary(),
-        "green_ai": GREEN_AI_URL
+        "ai_engine": "Google Gemini"
     }
 
 if __name__ == "__main__":
