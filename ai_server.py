@@ -1,91 +1,87 @@
-import asyncio
-import logging
-import time
-import uuid
 import os
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-import uvicorn
+import uuid
+import time
 import aiohttp
+import uvicorn
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AIServer")
+from pydantic import BaseModel
+from typing import Optional
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
-class AgentRegistration(BaseModel):
-    agent_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    phase: str = "embodied_agent"
-    capabilities: List[str] = []
-    metadata: Dict[str, Any] = {}
+PERSONALITIES = {
+    "friendly": "You are a warm, friendly assistant who loves helping people.",
+    "professional": "You are a professional business assistant. Be formal and precise.",
+    "humorous": "You are a fun, witty assistant. Use humor and jokes when appropriate.",
+    "teacher": "You are a patient teacher. Explain everything clearly and simply.",
+    "motivator": "You are an energetic life coach. Always motivate and inspire.",
+    "philosopher": "You are a deep thinker. Give thoughtful, reflective answers.",
+}
 
-class InferenceRequest(BaseModel):
-    agent_id: str
-    input: str
-    max_tokens: int = 256
+conversations = {}
 
-class InferenceResponse(BaseModel):
-    request_id: str
-    agent_id: str
-    output: str
-    phase: str
+app = FastAPI(title="All-in-One Chatbot API", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    personality: Optional[str] = "friendly"
+
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+    personality: str
     latency_ms: float
     timestamp: str
 
-class AgentRegistry:
-    def __init__(self):
-        self._agents = {}
-    def register(self, agent):
-        self._agents[agent.agent_id] = agent
-        return agent
-    def get(self, agent_id):
-        return self._agents.get(agent_id)
-    def all_agents(self):
-        return list(self._agents.values())
-    def phases_summary(self):
-        summary = defaultdict(int)
-        for a in self._agents.values():
-            summary[a.phase] += 1
-        return dict(summary)
-
-registry = AgentRegistry()
-start_time = time.time()
-request_counter = 0
-
-app = FastAPI(title="Humanoid to Server AI Transition Server")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 @app.get("/")
 async def root():
-    return {"server": "Humanoid to Server AI", "status": "online", "ai": "Google Gemini"}
+    return {
+        "api": "All-in-One Chatbot API",
+        "version": "1.0.0",
+        "status": "online",
+        "endpoints": ["/chat", "/chat/history", "/personalities", "/docs"]
+    }
 
-@app.post("/agents/register")
-async def register_agent(agent: AgentRegistration):
-    return registry.register(agent)
+@app.get("/personalities")
+async def list_personalities():
+    return {
+        "personalities": list(PERSONALITIES.keys()),
+        "descriptions": PERSONALITIES
+    }
 
-@app.get("/agents")
-async def list_agents():
-    return registry.all_agents()
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+    personality = req.personality if req.personality in PERSONALITIES else "friendly"
+    system_prompt = PERSONALITIES[personality]
 
-@app.post("/infer")
-async def infer(req: InferenceRequest):
-    global request_counter
-    agent = registry.get(req.agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    if session_id not in conversations:
+        conversations[session_id] = []
+
+    conversations[session_id].append({
+        "role": "user",
+        "message": req.message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+    history_text = ""
+    for msg in conversations[session_id][-6:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        history_text += f"{role}: {msg['message']}\n"
+
+    full_prompt = f"{system_prompt}\n\nConversation:\n{history_text}\nAssistant:"
+
     t0 = time.time()
-    output = ""
+    reply = ""
+
     try:
         async with aiohttp.ClientSession() as session:
-            payload = {
-                "contents": [{"parts": [{"text": req.input}]}]
-            }
+            payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
             async with session.post(
                 GEMINI_URL,
                 json=payload,
@@ -94,33 +90,45 @@ async def infer(req: InferenceRequest):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    output = data["candidates"][0]["content"]["parts"][0]["text"]
+                    reply = data["candidates"][0]["content"]["parts"][0]["text"]
                 else:
                     error = await resp.text()
-                    output = f"Gemini error: {error[:100]}"
+                    raise HTTPException(status_code=502, detail=f"Gemini error: {error[:200]}")
+    except HTTPException:
+        raise
     except Exception as e:
-        output = f"Error: {str(e)}"
+        raise HTTPException(status_code=500, detail=str(e))
+
     latency = round((time.time() - t0) * 1000, 2)
-    request_counter += 1
-    return InferenceResponse(
-        request_id=str(uuid.uuid4()),
-        agent_id=req.agent_id,
-        output=output,
-        phase=agent.phase,
+
+    conversations[session_id].append({
+        "role": "assistant",
+        "message": reply,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+    return ChatResponse(
+        session_id=session_id,
+        reply=reply,
+        personality=personality,
         latency_ms=latency,
         timestamp=datetime.now(timezone.utc).isoformat()
     )
 
-@app.get("/status")
-async def server_status():
+@app.get("/chat/history/{session_id}")
+async def chat_history(session_id: str):
+    if session_id not in conversations:
+        raise HTTPException(status_code=404, detail="Session not found")
     return {
-        "status": "online",
-        "uptime_seconds": round(time.time() - start_time, 2),
-        "total_agents": len(registry.all_agents()),
-        "total_requests": request_counter,
-        "phases": registry.phases_summary(),
-        "ai_engine": "Google Gemini"
+        "session_id": session_id,
+        "messages": conversations[session_id],
+        "total": len(conversations[session_id])
     }
+
+@app.delete("/chat/reset/{session_id}")
+async def reset_chat(session_id: str):
+    conversations.pop(session_id, None)
+    return {"message": "Conversation reset", "session_id": session_id}
 
 if __name__ == "__main__":
     uvicorn.run("ai_server:app", host="0.0.0.0", port=8000, reload=True)
